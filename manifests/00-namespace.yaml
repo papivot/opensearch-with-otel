@@ -1,0 +1,21 @@
+# Namespaces for the observability stack and the demo application.
+#
+# PSA: both namespaces are pinned to `privileged`. `observability` genuinely needs
+# it -- the OpenSearch chart's `sysctlInit` initContainer runs privileged to raise
+# vm.max_map_count (Ubuntu 24.04 nodes default to 65530, below OpenSearch's 262144
+# bootstrap check).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otel-demo
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest

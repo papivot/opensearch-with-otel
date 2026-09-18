@@ -1,0 +1,453 @@
+# JSON payloads applied to OpenSearch by the bootstrap Job (10-bootstrap-job.yaml).
+#
+# Data Prepper creates its own ISM policies only if they
+# are absent, and those defaults roll indices but never delete them. Pre-creating the
+# policies with a delete state is how the one-day retention requirement is met.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensearch-bootstrap-payloads
+  namespace: observability
+data:
+  # ---------------------------------------------------------------- ISM policies
+  # Policy ids are NOT arbitrary -- they are the exact ids Data Prepper looks for.
+  # Verified in data-prepper 2.16.0, IndexConstants.java:
+  #   RAW_ISM_POLICY = "raw-span-policy"
+  #   LOGS_ISM_POLICY = "logs-policy"
+  #   OTEL_APM_SERVICE_MAP_ISM_POLICY = "otel-v2-apm-service-map-policy"
+  #
+  # Upstream default for each is rollover-only (min_size 50gb / min_index_age 24h) with
+  # no delete state. We keep the rollover and add the delete transition.
+  ism--raw-span-policy.json: |
+    {
+      "policy": {
+        "description": "Traces: roll hourly, delete 1 day after rollover (demo retention)",
+        "default_state": "current_write_index",
+        "ism_template": [
+          { "index_patterns": ["otel-v1-apm-span-*"], "priority": 100 }
+        ],
+        "states": [
+          {
+            "name": "current_write_index",
+            "actions": [
+              { "rollover": { "min_index_age": "1h", "min_primary_shard_size": "10gb" } }
+            ],
+            "transitions": [
+              { "state_name": "delete", "conditions": { "min_rollover_age": "1d" } }
+            ]
+          },
+          {
+            "name": "delete",
+            "actions": [
+              { "timeout": "5m", "retry": { "count": 3, "backoff": "exponential", "delay": "1m" }, "delete": {} }
+            ],
+            "transitions": []
+          }
+        ]
+      }
+    }
+  ism--logs-policy.json: |
+    {
+      "policy": {
+        "description": "Logs: roll hourly, delete 1 day after rollover (demo retention)",
+        "default_state": "current_write_index",
+        "ism_template": [
+          { "index_patterns": ["logs-otel-v1-*"], "priority": 100 }
+        ],
+        "states": [
+          {
+            "name": "current_write_index",
+            "actions": [
+              { "rollover": { "min_index_age": "1h", "min_primary_shard_size": "10gb" } }
+            ],
+            "transitions": [
+              { "state_name": "delete", "conditions": { "min_rollover_age": "1d" } }
+            ]
+          },
+          {
+            "name": "delete",
+            "actions": [
+              { "timeout": "5m", "retry": { "count": 3, "backoff": "exponential", "delay": "1m" }, "delete": {} }
+            ],
+            "transitions": []
+          }
+        ]
+      }
+    }
+  # The service map is a single small, continuously-updated index that Data Prepper
+  # rebuilds from each time window. Deleting it daily would blank the application map
+  # for no benefit, so this policy only rolls it and never deletes.
+  ism--otel-v2-apm-service-map-policy.json: |
+    {
+      "policy": {
+        "description": "Service map: roll daily, never delete (rebuilt continuously)",
+        "default_state": "current_write_index",
+        "ism_template": [
+          { "index_patterns": ["otel-v2-apm-service-map-*"], "priority": 100 }
+        ],
+        "states": [
+          {
+            "name": "current_write_index",
+            "actions": [
+              { "rollover": { "min_index_age": "24h", "min_primary_shard_size": "5gb" } }
+            ],
+            "transitions": []
+          }
+        ]
+      }
+    }
+  # Metrics are written by the OTel Collector with a date suffix (not a rollover alias),
+  # so age is measured from index creation.
+  ism--ss4o-metrics-policy.json: |
+    {
+      "policy": {
+        "description": "Metrics: delete 1 day after index creation (demo retention)",
+        "default_state": "hot",
+        "ism_template": [
+          { "index_patterns": ["ss4o_metrics-*"], "priority": 100 }
+        ],
+        "states": [
+          {
+            "name": "hot",
+            "actions": [],
+            "transitions": [
+              { "state_name": "delete", "conditions": { "min_index_age": "1d" } }
+            ]
+          },
+          {
+            "name": "delete",
+            "actions": [
+              { "timeout": "5m", "retry": { "count": 3, "backoff": "exponential", "delay": "1m" }, "delete": {} }
+            ],
+            "transitions": []
+          }
+        ]
+      }
+    }
+
+  # ------------------------------------------------------------- index templates
+  #
+  # CAREFUL -- there are two template systems in play and mixing them breaks traces.
+  #
+  # Data Prepper 2.16.0 defaults to templateType V1, i.e. it registers LEGACY
+  # `_template` objects for its managed index families (verified in
+  # IndexConfiguration.determineTemplateType: non-serverless, non-ES6 => TemplateType.V1).
+  # In OpenSearch, a matching *composable* `_index_template` takes precedence over legacy
+  # templates entirely -- it does not merge. So a composable template matching
+  # `otel-v1-*` would silently shadow Data Prepper's span mappings and Trace Analytics
+  # would stop resolving fields.
+  #
+  # Therefore:
+  #   * Data Prepper's families get a LEGACY template (legacy--*.json, order 100).
+  #     Legacy templates DO merge by order, so this contributes settings only and leaves
+  #     Data Prepper's mappings intact.
+  #   * ss4o_metrics-* is written by the OTel Collector, which Data Prepper never touches,
+  #     so it gets a composable template (template--*.json) and full mapping control.
+  #
+  # Single node => replicas must be 0 or every index sits yellow forever.
+  # auto_expand_replicas means this still does the right thing if workers are added.
+  legacy--otel-defaults.json: |
+    {
+      "order": 100,
+      "index_patterns": ["otel-v1-*", "otel-v2-*", "logs-otel-v1*", "metrics-otel-v1*"],
+      "settings": {
+        "index.number_of_shards": 1,
+        "index.number_of_replicas": 0,
+        "index.auto_expand_replicas": "0-1",
+        "index.refresh_interval": "10s",
+        "index.mapping.total_fields.limit": 4000
+      },
+      "mappings": {
+        "properties": {
+          "attributes": { "type": "flat_object" },
+          "log":      { "properties": { "attributes": { "type": "flat_object" } } },
+          "span":     { "properties": { "attributes": { "type": "flat_object" } } },
+          "resource": { "properties": { "attributes": { "type": "flat_object" } } },
+          "instrumentationScope": { "properties": { "attributes": { "type": "flat_object" } } },
+          "events":   { "type": "nested", "properties": { "attributes": { "type": "flat_object" } } },
+          "serviceName":  { "type": "keyword" },
+          "k8sNamespace": { "type": "keyword" },
+          "k8sPod":       { "type": "keyword" },
+          "k8sNode":      { "type": "keyword" },
+          "k8sContainer": { "type": "keyword" },
+          "hostName":     { "type": "keyword" }
+        }
+      }
+    }
+
+  # Mapping for the metrics index family, REQUIRED before the first metric document.
+  # Without it OpenSearch's dynamic mapping infers types from whatever it sees first --
+  # notably `date` (millisecond) for nanosecond timestamps, and `integer` for int64
+  # counters, after which later documents are rejected.
+  #
+  # These mappings are NOT hand-written. They are Data Prepper 2.16.0's own
+  # metrics-otel-v1-index-standard-template.json mappings, re-pointed at the
+  # `ss4o_metrics-*` pattern. That matters because metrics are written by Data Prepper's
+  # `otel_metrics` processor, so its document shape is the authoritative one -- and
+  # because the index name has to match `ss4o_metrics-*-*`, which is what the
+  # Observability -> Metrics view looks for (hardcoded in dashboards-observability
+  # common/constants/metrics.ts). Regenerate with:
+  #
+  #   curl -sfL https://raw.githubusercontent.com/opensearch-project/data-prepper/2.16.0/\
+  #     data-prepper-plugins/opensearch/src/main/resources/\
+  #     metrics-otel-v1-index-standard-template.json
+  #
+  # and wrap its .mappings in index_patterns/priority/settings.
+  template--ss4o-metrics.json: |
+    {
+      "index_patterns": [
+        "ss4o_metrics-*"
+      ],
+      "priority": 200,
+      "template": {
+        "settings": {
+          "index.number_of_shards": 1,
+          "index.number_of_replicas": 0,
+          "index.refresh_interval": "10s",
+          "index.mapping.total_fields.limit": 4000
+        },
+        "mappings": {
+          "date_detection": false,
+          "_source": {
+            "enabled": true
+          },
+          "dynamic_templates": [],
+          "properties": {
+            "droppedAttributesCount": {
+              "type": "integer"
+            },
+            "instrumentationScope": {
+              "properties": {
+                "droppedAttributesCount": {
+                  "type": "integer"
+                },
+                "schemaUrl": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                },
+                "name": {
+                  "type": "keyword",
+                  "ignore_above": 128
+                },
+                "version": {
+                  "type": "keyword",
+                  "ignore_above": 64
+                },
+                "attributes": {
+                  "type": "flat_object"
+                }
+              }
+            },
+            "resource": {
+              "properties": {
+                "droppedAttributesCount": {
+                  "type": "integer"
+                },
+                "schemaUrl": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                },
+                "attributes": {
+                  "type": "flat_object"
+                }
+              }
+            },
+            "name": {
+              "type": "keyword",
+              "ignore_above": 256
+            },
+            "description": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 256
+                }
+              }
+            },
+            "flags": {
+              "type": "long"
+            },
+            "unit": {
+              "type": "keyword",
+              "ignore_above": 128
+            },
+            "kind": {
+              "type": "keyword",
+              "ignore_above": 32
+            },
+            "aggregationTemporality": {
+              "type": "keyword",
+              "ignore_above": 64
+            },
+            "monotonic": {
+              "type": "boolean"
+            },
+            "startTime": {
+              "type": "date_nanos"
+            },
+            "@timestamp": {
+              "type": "date_nanos"
+            },
+            "time": {
+              "type": "date_nanos"
+            },
+            "value@int": {
+              "type": "long"
+            },
+            "value@double": {
+              "type": "double"
+            },
+            "value": {
+              "type": "double"
+            },
+            "buckets": {
+              "type": "nested",
+              "properties": {
+                "count": {
+                  "type": "long"
+                },
+                "sum": {
+                  "type": "double"
+                },
+                "max": {
+                  "type": "double"
+                },
+                "min": {
+                  "type": "double"
+                }
+              }
+            },
+            "bucketCount": {
+              "type": "long"
+            },
+            "bucketCountsList": {
+              "type": "long"
+            },
+            "explicitBoundsList": {
+              "type": "double"
+            },
+            "explicitBoundsCount": {
+              "type": "double"
+            },
+            "quantiles": {
+              "properties": {
+                "quantile": {
+                  "type": "double"
+                },
+                "value": {
+                  "type": "double"
+                }
+              }
+            },
+            "quantileValuesCount": {
+              "type": "long"
+            },
+            "positiveBuckets": {
+              "type": "nested",
+              "properties": {
+                "count": {
+                  "type": "long"
+                },
+                "max": {
+                  "type": "double"
+                },
+                "min": {
+                  "type": "double"
+                }
+              }
+            },
+            "negativeBuckets": {
+              "type": "nested",
+              "properties": {
+                "count": {
+                  "type": "long"
+                },
+                "max": {
+                  "type": "double"
+                },
+                "min": {
+                  "type": "double"
+                }
+              }
+            },
+            "negativeOffset": {
+              "type": "integer"
+            },
+            "positiveOffset": {
+              "type": "integer"
+            },
+            "zeroCount": {
+              "type": "long"
+            },
+            "scale": {
+              "type": "long"
+            },
+            "max": {
+              "type": "double"
+            },
+            "min": {
+              "type": "double"
+            },
+            "sum": {
+              "type": "double"
+            },
+            "count": {
+              "type": "long"
+            },
+            "exemplar": {
+              "properties": {
+                "time": {
+                  "type": "date_nanos"
+                },
+                "traceId": {
+                  "ignore_above": 256,
+                  "type": "keyword"
+                },
+                "spanId": {
+                  "ignore_above": 256,
+                  "type": "keyword"
+                },
+                "value@int": {
+                  "type": "long"
+                },
+                "value@double": {
+                  "type": "double"
+                },
+                "value": {
+                  "type": "double"
+                }
+              }
+            },
+            "attributes": {
+              "type": "flat_object"
+            },
+            "serviceName": {
+              "type": "keyword"
+            },
+            "k8sNamespace": {
+              "type": "keyword"
+            },
+            "k8sNode": {
+              "type": "keyword"
+            },
+            "k8sPod": {
+              "type": "keyword"
+            }
+          },
+          "numeric_detection": false
+        }
+      }
+    }
+
+  # ------------------------------------------------------------ cluster settings
+  # ISM otherwise retains 30 days of its own audit history, which would outlive every
+  # index it manages.
+  settings--cluster.json: |
+    {
+      "persistent": {
+        "plugins.index_state_management.history.enabled": "false",
+        "plugins.index_state_management.job_interval": "1",
+        "plugins.index_state_management.jitter": "0.1"
+      }
+    }

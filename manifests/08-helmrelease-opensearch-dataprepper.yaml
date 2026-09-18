@@ -1,0 +1,347 @@
+# Data Prepper 2.16.0 -- the component that turns spans into the two things the
+# OpenSearch trace UIs actually read: otel-v1-apm-span-* and otel-v2-apm-service-map.
+#
+# Stage 1 authenticates to OpenSearch as `admin` (the static password in
+# manifests/05-secret-opensearch-admin.yaml, duplicated below as a literal string --
+# pipelineConfig.config is native Helm values, not env-substituted, so it cannot read a
+# Secret directly). There is no separate `otel_ingest` user in this stage; keep the
+# literal password below in sync by hand if you change the Secret.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: data-prepper
+  namespace: observability
+spec:
+  interval: 30m
+  timeout: 15m
+  releaseName: data-prepper
+  targetNamespace: observability
+  storageNamespace: observability
+  dependsOn:
+    - name: opensearch
+  chart:
+    spec:
+      chart: data-prepper
+      version: "0.3.1"
+      sourceRef:
+        kind: HelmRepository
+        name: opensearch
+      interval: 12h
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    cleanupOnFail: true
+    remediation:
+      retries: 3
+      strategy: rollback
+  driftDetection:
+    mode: enabled
+
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              kind: Deployment
+              name: data-prepper
+            patch: |
+              - op: replace
+                path: /spec/template/spec/containers/0/livenessProbe
+                value:
+                  httpGet:
+                    path: /list
+                    port: server
+                  initialDelaySeconds: 120
+                  periodSeconds: 15
+                  timeoutSeconds: 5
+                  failureThreshold: 6
+              - op: replace
+                path: /spec/template/spec/containers/0/readinessProbe
+                value:
+                  httpGet:
+                    path: /list
+                    port: server
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 30
+  values:
+    global:
+      dockerRegistry: mirror.gcr.io
+
+    image:
+      repository: opensearchproject/data-prepper
+      tag: "2.16.0"
+      pullPolicy: IfNotPresent
+
+    replicaCount: 1
+
+    resources:
+      requests:
+        cpu: "300m"
+        memory: "1Gi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+
+    extraEnvs:
+      - name: JAVA_OPTS
+        value: "-Xms512m -Xmx1g"
+
+    ports:
+      - name: otlp
+        port: 21893
+
+    service:
+      type: ClusterIP
+
+    config:
+      data-prepper-config.yaml: |
+        # Data Prepper's own API server (/list, :4900) -- plain HTTP.
+        ssl: false
+
+        # PEER FORWARDER. This block is not optional here.
+        #
+        # Both otel_traces and otel_apm_service_map are stateful processors, so Data
+        # Prepper always starts its peer-forwarding server -- even at replicaCount 1 with
+        # the default local discovery. PeerForwarderConfiguration defaults `ssl` to TRUE
+        # with ssl_certificate_file = "config/default_certificate.pem", and that file does
+        # not exist in the image. The result is a crash loop at startup with the pipeline
+        # already fully parsed:
+        #     ERROR FileCertificateProvider - Error encountered while reading the certificate
+        #     java.nio.file.NoSuchFileException: config/default_certificate.pem
+        #     Exception in thread "main" ... PeerForwarderServerProxy.start
+        peer_forwarder:
+          ssl: false
+
+    # Inline pipeline definitions as native Helm values (pipelineConfig.config is a
+    # nested map, verified via `helm show values opensearch/data-prepper --version
+    # 0.3.1`) -- no existingSecret, no create-secrets.sh substitution step. The pipeline
+    # LOGIC below is unchanged from earlier iterations of this stack: one otlp source
+    # routed by event type, the dual otel-v1/otel-v2 service-map schemas (OpenSearch's
+    # classic and newer APM UIs each hardcode a different one), the copy_values field
+    # promotions, and the hourly ss4o_metrics index. Plugin names/defaults are from
+    # data-prepper 2.16.0 source, not docs:
+    #   otlp source            -> @DataPrepperPlugin(name = "otlp"), DEFAULT_PORT = 21893,
+    #                             DEFAULT_SSL = true  (hence the explicit ssl: false)
+    #   otel_apm_service_map   -> @DataPrepperPlugin(name = "otel_apm_service_map")
+    #   index_type values      -> IndexType enum in IndexConstants.java
+    pipelineConfig:
+      demoPipeline: "false"
+      enabled: true
+      config:
+        version: "2"
+
+        otlp-pipeline:
+          workers: 2
+          delay: 100
+          source:
+            otlp:
+              port: 21893
+              ssl: false
+              request_timeout: 10s
+              max_request_length: 10mb
+              thread_count: 50
+              max_connection_count: 200
+          buffer:
+            bounded_blocking:
+              buffer_size: 25600
+              batch_size: 400
+          route:
+            - logs: 'getEventType() == "LOG"'
+            - traces: 'getEventType() == "TRACE"'
+            - metrics: 'getEventType() == "METRIC"'
+          sink:
+            - pipeline:
+                name: otel-logs-pipeline
+                routes:
+                  - logs
+            - pipeline:
+                name: otel-traces-pipeline
+                routes:
+                  - traces
+            - pipeline:
+                name: otel-metrics-pipeline
+                routes:
+                  - metrics
+
+        otel-logs-pipeline:
+          workers: 2
+          source:
+            pipeline:
+              name: otlp-pipeline
+          processor:
+            - copy_values:
+                entries:
+                  - from_key: "time"
+                    to_key: "@timestamp"
+                  - from_key: "/resource/attributes/service.name"
+                    to_key: "serviceName"
+                  - from_key: "/resource/attributes/k8s.namespace.name"
+                    to_key: "k8sNamespace"
+                  - from_key: "/resource/attributes/k8s.pod.name"
+                    to_key: "k8sPod"
+                  - from_key: "/resource/attributes/k8s.container.name"
+                    to_key: "k8sContainer"
+                  - from_key: "/resource/attributes/host.name"
+                    to_key: "hostName"
+          sink:
+            - opensearch:
+                hosts: ["https://observability-master:9200"]
+                username: "admin"
+                password: "YdYPd6FoPTlN7lun4KPcn3If#7Kx!"
+                insecure: true
+                index_type: log-analytics
+                bulk_size: 5
+                max_retries: 5
+
+        otel-traces-pipeline:
+          workers: 2
+          source:
+            pipeline:
+              name: otlp-pipeline
+          sink:
+            - pipeline:
+                name: traces-raw-pipeline
+            - pipeline:
+                name: service-map-pipeline
+            - pipeline:
+                name: service-map-v1-pipeline
+
+        traces-raw-pipeline:
+          workers: 2
+          source:
+            pipeline:
+              name: otel-traces-pipeline
+          processor:
+            - otel_traces: {}
+          sink:
+            - opensearch:
+                hosts: ["https://observability-master:9200"]
+                username: "admin"
+                password: "YdYPd6FoPTlN7lun4KPcn3If#7Kx!"
+                insecure: true
+                # -> otel-v1-apm-span-* behind the otel-v1-apm-span rollover alias.
+                # Governed by the pre-created `raw-span-policy` ISM policy.
+                index_type: trace-analytics-raw
+                bulk_size: 5
+                max_retries: 5
+
+        service-map-pipeline:
+          workers: 1
+          source:
+            pipeline:
+              name: otel-traces-pipeline
+          processor:
+            - otel_apm_service_map:
+                # Short window so the map appears quickly in a demo (default 60s).
+                window_duration: 30s
+                db_path: /var/lib/data-prepper/service-map/
+                group_by_attributes:
+                  - telemetry.sdk.language
+          route:
+            - service_map: 'getEventType() == "SERVICE_MAP"'
+          sink:
+            - opensearch:
+                hosts: ["https://observability-master:9200"]
+                username: "admin"
+                password: "YdYPd6FoPTlN7lun4KPcn3If#7Kx!"
+                insecure: true
+                index_type: otel-v2-apm-service-map
+                routes:
+                  - service_map
+                bulk_size: 5
+                max_retries: 5
+
+        otel-metrics-pipeline:
+          workers: 2
+          source:
+            pipeline:
+              name: otlp-pipeline
+          processor:
+            - otel_metrics:
+                calculate_histogram_buckets: true
+                flatten_attributes: false
+            - copy_values:
+                entries:
+                  - from_key: "/resource/attributes/service.name"
+                    to_key: "serviceName"
+                  - from_key: "/resource/attributes/k8s.namespace.name"
+                    to_key: "k8sNamespace"
+                  - from_key: "/resource/attributes/k8s.node.name"
+                    to_key: "k8sNode"
+                  - from_key: "/resource/attributes/k8s.pod.name"
+                    to_key: "k8sPod"
+          sink:
+            - opensearch:
+                hosts: ["https://observability-master:9200"]
+                username: "admin"
+                password: "YdYPd6FoPTlN7lun4KPcn3If#7Kx!"
+                insecure: true
+                index_type: custom
+                index: "ss4o_metrics-otel-%{yyyy.MM.dd.HH}"
+                bulk_size: 5
+                max_retries: 5
+
+        service-map-v1-pipeline:
+          workers: 1
+          source:
+            pipeline:
+              name: otel-traces-pipeline
+          processor:
+            - service_map:
+                # Default is 180s; shortened so the map fills in quickly during a demo.
+                window_duration: 30
+                db_path: /var/lib/data-prepper/service-map-v1/
+          sink:
+            - opensearch:
+                hosts: ["https://observability-master:9200"]
+                username: "admin"
+                password: "YdYPd6FoPTlN7lun4KPcn3If#7Kx!"
+                insecure: true
+                index_type: trace-analytics-service-map
+                bulk_size: 5
+                max_retries: 5
+
+    volumes:
+      - name: service-map-state
+        emptyDir:
+          sizeLimit: 2Gi
+    volumeMounts:
+      - name: service-map-state
+        mountPath: /var/lib/data-prepper
+
+    initContainers:
+      - name: wait-for-bootstrap
+        image: mirror.gcr.io/curlimages/curl:8.11.1
+        command: ["/bin/sh", "-eu", "-c"]
+        args:
+          - |
+            i=0
+            until curl -sk -o /dev/null --fail \
+                -u "admin:${OS_PASSWORD}" \
+                "https://observability-master:9200/_plugins/_ism/policies/raw-span-policy"; do
+              i=$((i+1))
+              [ "$i" -ge 180 ] && { echo "raw-span-policy never appeared -- is the opensearch-bootstrap Job healthy?"; exit 1; }
+              echo "waiting for opensearch-bootstrap to install ISM policies (attempt $i)"
+              sleep 10
+            done
+            echo "bootstrap complete"
+        env:
+          - name: OS_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: opensearch-bootstrap
+                key: admin-password
+        resources:
+          requests:
+            cpu: "25m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "64Mi"
+
+    ingress:
+      enabled: false
+    autoscaling:
+      enabled: false

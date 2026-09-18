@@ -1,0 +1,120 @@
+# Gateway collector: the single OTLP ingest point for the demo app and the per-node
+# agents. Managed by the OpenTelemetry Operator (see manifests/02-helmrelease-oteloperator.yaml)
+# via an OpenTelemetryCollector CR rather than a separate Helm release.
+#
+# The operator names the generated Service "<metadata.name>-collector", i.e.
+# otel-gateway-collector, not otel-gateway. Every reference to this collector (the
+# agent's exporter, the demo's OTEL_COLLECTOR_NAME, verify.sh) uses that name.
+#
+# Signal routing:
+#   traces  -> Data Prepper  (only it can build the service map)
+#   logs    -> Data Prepper  (logs-otel-v1-*, correlates to spans on traceId)
+#   metrics -> Data Prepper  (the released opensearchexporter cannot do metrics)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-gateway
+  namespace: observability
+---
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-gateway
+  namespace: observability
+spec:
+  mode: deployment
+  replicas: 1
+  serviceAccount: otel-gateway
+  image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-k8s:0.159.0
+
+  resources:
+    requests:
+      cpu: "300m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+  env:
+    - name: MY_POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+
+  ports:
+    - name: otlp
+      port: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      protocol: TCP
+    # Exposed so `otelcol_exporter_sent_*` can be checked during verification.
+    - name: metrics
+      port: 8888
+      protocol: TCP
+
+  config:
+    extensions:
+      health_check:
+        endpoint: ${env:MY_POD_IP}:13133
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: ${env:MY_POD_IP}:4317
+            max_recv_msg_size_mib: 16
+          http:
+            endpoint: ${env:MY_POD_IP}:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+        send_batch_max_size: 2048
+      transform/k6_cardinality:
+        error_mode: ignore
+        metric_statements:
+          - context: datapoint
+            statements:
+              - replace_pattern(attributes["url"], "[?].*", "")
+          - context: metric
+            statements:
+              - aggregate_on_attributes("sum", ["scenario", "method", "proto", "resource_type", "url"]) where IsMatch(name, "^k6[.]browser_")
+      # Tags everything with the cluster so multi-cluster indices stay separable.
+      resource/cluster:
+        attributes:
+          - key: k8s.cluster.name
+            value: workload-vsphere-vks2
+            action: upsert
+
+    exporters:
+      otlp_grpc/dataprepper:
+        endpoint: data-prepper:21893
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 5000
+        retry_on_failure:
+          enabled: true
+
+    service:
+      extensions:
+        - health_check
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resource/cluster, batch]
+          exporters: [otlp_grpc/dataprepper]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resource/cluster, batch]
+          exporters: [otlp_grpc/dataprepper]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, transform/k6_cardinality, resource/cluster, batch]
+          exporters: [otlp_grpc/dataprepper]

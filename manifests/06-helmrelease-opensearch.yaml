@@ -1,0 +1,146 @@
+# OpenSearch 3.8.0, single node, security plugin enabled with the chart's own built-in
+# demo security config -- HTTP Basic auth only for stage 
+
+# The only credential involved is `OPENSEARCH_INITIAL_ADMIN_PASSWORD`, sourced from the
+# static Secret in manifests/05-secret-opensearch-admin.yaml. Setting that env var only
+# ever changes the shipped demo config's `admin` user -- every other demo account (in
+# particular `kibanaserver`, used by manifests/07-hr-opensearch-dashboards.yaml) keeps
+# its well-known chart-default password.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: opensearch
+  namespace: observability
+spec:
+  interval: 30m
+  timeout: 20m
+  releaseName: opensearch
+  targetNamespace: observability
+  storageNamespace: observability
+  chart:
+    spec:
+      chart: opensearch
+      version: "3.8.0"
+      sourceRef:
+        kind: HelmRepository
+        name: opensearch
+      interval: 12h
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+    timeout: 20m
+  upgrade:
+    crds: CreateReplace
+    cleanupOnFail: true
+    remediation:
+      retries: 3
+      strategy: rollback
+    timeout: 20m
+  driftDetection:
+    mode: enabled
+  values:
+    global:
+      dockerRegistry: mirror.gcr.io
+
+    clusterName: observability
+    nodeGroup: master
+    # masterService MUST equal "<clusterName>-<nodeGroup>" or headless discovery breaks.
+    masterService: observability-master
+
+    singleNode: true
+    replicas: 1
+    roles:
+      - master
+      - ingest
+      - data
+      - remote_cluster_client
+
+    image:
+      repository: opensearchproject/opensearch
+      tag: "3.8.0"
+      pullPolicy: IfNotPresent
+
+    opensearchJavaOpts: "-Xms2g -Xmx2g"
+
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "3Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    initResources:
+      requests:
+        cpu: "25m"
+        memory: "64Mi"
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
+
+    # Privileged initContainer that raises vm.max_map_count to 262144.
+    # Required on these Ubuntu 24.04 nodes (default 65530) or the bootstrap check fails.
+    sysctlInit:
+      enabled: true
+    sysctlVmMaxMapCount: 262144
+
+    persistence:
+      enabled: true
+      enableInitChown: true
+      # CHANGE THIS to your cluster's StorageClass. "vsan-esa-default-policy-raid5-latebinding"
+      # is specific to this repo's original vSphere/VKS cluster (late-binding so the PV is
+      # provisioned in the same zone the pod lands in) -- it will not exist elsewhere.
+      storageClass: "vsan-esa-default-policy-raid5-latebinding"
+      accessModes:
+        - ReadWriteOnce
+      size: 30Gi
+
+    terminationGracePeriod: 120
+
+    extraEnvs:
+      - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: opensearch-bootstrap
+            key: admin-password
+      - name: bootstrap.memory_lock
+        value: "true"
+
+    # ============================ READ BEFORE EDITING ============================
+    # This file MUST NOT contain any key beginning with `plugins.security`.
+    #
+    # At container start the entrypoint runs the demo-config installer, which calls
+    # SecuritySettingsConfigurer.checkIfSecurityPluginIsAlreadyConfigured(). That method
+    # iterates the top-level keys of opensearch.yml and, on finding ANY key starting with
+    # "plugins.security", prints "seems to be already configured for Security. Quit." and
+    # exits -- BEFORE writing the TLS settings and generating the demo certificates.
+    # The node then dies at startup with:
+    #     failed to load plugin class [org.opensearch.security.OpenSearchSecurityPlugin]
+    #     Caused by: OpenSearchException[No SSL configuration found]
+    #
+    # The installer itself writes plugins.security.ssl.{transport,http}.*,
+    # allow_unsafe_democertificates, allow_default_init_securityindex, authcz.admin_dn,
+    # audit.type and plugins.security.restapi.roles_enabled -- so there is nothing to add
+    # here. It also APPENDS, so a duplicate of any key it writes makes SnakeYAML throw
+    # "found duplicate key" and the node refuses to start for a different reason.
+    #
+    # ISM tuning lives in the bootstrap Job's persistent cluster settings instead
+    # (manifests/09-bootstrap-payloads.yaml -> settings--cluster.json), which is dynamic
+    # and avoids touching this file at all.
+    # =============================================================================
+    config:
+      opensearch.yml: |
+        cluster.name: observability
+        network.host: 0.0.0.0
+
+    # securityConfig is intentionally left at its chart defaults (enabled: true,
+    # internalUsersSecret unset, config.data empty) -- the image's own shipped demo
+    # security config is used as-is: `admin` (password set above), `kibanaserver`
+    # (chart-default password, used by Dashboards), and the other stock demo accounts.
+    # Stage 1 does not define a separate ingest identity -- Data Prepper
+    # (manifests/08-hr-data-prepper.yaml) authenticates as `admin` too.
+
+    serviceMonitor:
+      enabled: false
+    ingress:
+      enabled: false

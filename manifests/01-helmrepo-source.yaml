@@ -1,0 +1,25 @@
+# Chart sources for the Flux source-controller.
+#
+# Both repositories are plain HTTP(S) Helm repositories; source-controller fetches
+# index.yaml directly, so the cluster needs egress to these two hosts.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: opensearch
+  namespace: observability
+spec:
+  type: default
+  url: https://opensearch-project.github.io/helm-charts
+  interval: 1h
+  timeout: 2m
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: open-telemetry
+  namespace: observability
+spec:
+  type: default
+  url: https://open-telemetry.github.io/opentelemetry-helm-charts
+  interval: 1h
+  timeout: 2m

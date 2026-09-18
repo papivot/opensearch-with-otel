@@ -1,0 +1,143 @@
+# One-shot bootstrap of OpenSearch: retention policies, index templates, cluster settings.
+#
+# ORDERING MATTERS. This must complete before Data Prepper first writes, because:
+#   * Data Prepper creates its ISM policies only if absent -- our versions must land first.
+#   * The ss4o metrics mapping must exist before the first metric document, or dynamic
+#     mapping locks in the wrong field types.
+# Data Prepper enforces this itself with an initContainer that waits for `raw-span-policy`
+# (see 08-hr-data-prepper.yaml), so apply order between the two is not load-bearing.
+#
+# Re-runnable: existing ISM policies are updated using if_seq_no/if_primary_term rather
+# than failing on the 409 that a plain PUT returns.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opensearch-bootstrap
+  namespace: observability
+  annotations:
+    # Lets `kubectl apply` recreate the Job after the payload ConfigMap changes
+    # (Job spec is immutable, so the old object must be deleted first -- see
+    # scripts/apply.sh which does this).
+    observability/payload-source: opensearch-bootstrap-payloads
+spec:
+  backoffLimit: 20
+  # Reap the Job 1h after it finishes so repeated runs stay tidy.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opensearch-bootstrap
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+      volumes:
+        - name: payloads
+          configMap:
+            name: opensearch-bootstrap-payloads
+      containers:
+        - name: bootstrap
+          image: mirror.gcr.io/curlimages/curl:8.11.1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: OS_URL
+              value: "https://observability-master:9200"
+            - name: OS_USER
+              value: "admin"
+            - name: OS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-bootstrap
+                  key: admin-password
+          volumeMounts:
+            - name: payloads
+              mountPath: /payloads
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          command: ["/bin/sh", "-eu", "-c"]
+          args:
+            - |
+              # -k throughout: OpenSearch is serving the demo self-signed HTTP cert.
+              CURL="curl -sk -u ${OS_USER}:${OS_PASSWORD} -H content-type:application/json"
+
+              say() { echo "[bootstrap] $*"; }
+
+              say "waiting for OpenSearch at ${OS_URL} ..."
+              i=0
+              until $CURL -o /dev/null -w '' --fail "${OS_URL}/_cluster/health?wait_for_status=yellow&timeout=30s"; do
+                i=$((i+1))
+                [ "$i" -ge 180 ] && { say "OpenSearch never became ready after 30m"; exit 1; }
+                say "  not ready yet (attempt $i), sleeping 10s"
+                sleep 10
+              done
+              say "OpenSearch is up"
+
+              # ---------------------------------------------------------------- ISM
+              for f in /payloads/ism--*.json; do
+                [ -e "$f" ] || continue
+                id=$(basename "$f" .json); id=${id#ism--}
+                url="${OS_URL}/_plugins/_ism/policies/${id}"
+
+                existing=$($CURL "$url" || true)
+                case "$existing" in
+                  *'"_seq_no"'*)
+                    seq=$(echo "$existing"  | tr ',' '\n' | grep -o '"_seq_no":[0-9]*'       | head -1 | cut -d: -f2)
+                    term=$(echo "$existing" | tr ',' '\n' | grep -o '"_primary_term":[0-9]*' | head -1 | cut -d: -f2)
+                    say "updating ISM policy ${id} (seq_no=${seq} primary_term=${term})"
+                    resp=$($CURL -X PUT "${url}?if_seq_no=${seq}&if_primary_term=${term}" -d @"$f")
+                    ;;
+                  *)
+                    say "creating ISM policy ${id}"
+                    resp=$($CURL -X PUT "$url" -d @"$f")
+                    ;;
+                esac
+                case "$resp" in
+                  *'"error"'*) say "FAILED on ${id}: $resp"; exit 1 ;;
+                  *)           say "  ok" ;;
+                esac
+              done
+
+              # ---------------------------------------------- legacy (_template)
+              # Merged by `order` on top of Data Prepper's own legacy templates,
+              # contributing settings without disturbing its mappings.
+              for f in /payloads/legacy--*.json; do
+                [ -e "$f" ] || continue
+                name=$(basename "$f" .json); name=${name#legacy--}
+                say "putting legacy template ${name}"
+                resp=$($CURL -X PUT "${OS_URL}/_template/${name}" -d @"$f")
+                case "$resp" in
+                  *'"error"'*) say "FAILED on ${name}: $resp"; exit 1 ;;
+                  *)           say "  ok" ;;
+                esac
+              done
+
+              # ------------------------------- composable (_index_template)
+              for f in /payloads/template--*.json; do
+                [ -e "$f" ] || continue
+                name=$(basename "$f" .json); name=${name#template--}
+                say "putting index template ${name}"
+                resp=$($CURL -X PUT "${OS_URL}/_index_template/${name}" -d @"$f")
+                case "$resp" in
+                  *'"error"'*) say "FAILED on ${name}: $resp"; exit 1 ;;
+                  *)           say "  ok" ;;
+                esac
+              done
+
+              # ----------------------------------------------------- cluster settings
+              if [ -e /payloads/settings--cluster.json ]; then
+                say "putting cluster settings"
+                resp=$($CURL -X PUT "${OS_URL}/_cluster/settings" -d @/payloads/settings--cluster.json)
+                case "$resp" in
+                  *'"error"'*) say "FAILED on cluster settings: $resp"; exit 1 ;;
+                  *)           say "  ok" ;;
+                esac
+              fi
+
+              say "done"

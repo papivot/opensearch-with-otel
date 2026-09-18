@@ -1,0 +1,124 @@
+# OpenSearch Dashboards 3.8.0, HTTP Basic auth only, exposed directly as a
+# Service type: LoadBalancer (plain HTTP, no TLS, no Gateway).
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: opensearch-dashboards
+  namespace: observability
+spec:
+  interval: 30m
+  timeout: 15m
+  releaseName: opensearch-dashboards
+  targetNamespace: observability
+  storageNamespace: observability
+  dependsOn:
+    - name: opensearch
+  chart:
+    spec:
+      chart: opensearch-dashboards
+      version: "3.8.0"
+      sourceRef:
+        kind: HelmRepository
+        name: opensearch
+      interval: 12h
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    cleanupOnFail: true
+    remediation:
+      retries: 3
+      strategy: rollback
+  driftDetection:
+    mode: enabled
+
+  # The chart's service.yaml template always sets targetPort to the SAME value as
+  # service.port (it never reads the container's actual listen port), so simply setting
+  # service.port: 80 while the container listens on 5601 would break connectivity.
+  # Keep service.port at 5601 (matches server.port below) and use the same postRenderers
+  # technique already used for the demo's frontend-proxy Service to ADD an external port
+  # 80 -- not replace 5601, which scripts/import-dashboards.sh, export-dashboards.sh and
+  # verify.sh still rely on for their port-forward fallback.
+  #
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              kind: Service
+              name: opensearch-dashboards
+            patch: |
+              - op: replace
+                path: /spec/ports/0/port
+                value: 80
+              - op: add
+                path: /spec/ports/-
+                value:
+                  name: dashboards-internal
+                  port: 5601
+                  targetPort: 5601
+                  protocol: TCP
+  values:
+    image:
+      repository: mirror.gcr.io/opensearchproject/opensearch-dashboards
+      tag: "3.8.0"
+      pullPolicy: IfNotPresent
+
+    opensearchHosts: "https://observability-master:9200"
+
+    replicaCount: 1
+
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "1Gi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+
+    serverHost: "0.0.0.0"
+
+    service:
+      type: LoadBalancer
+      port: 5601
+
+    config:
+      opensearch_dashboards.yml: |
+        server.name: dashboards
+        server.host: "0.0.0.0"
+        server.port: 5601
+
+        opensearch.hosts: ["https://observability-master:9200"]
+        # `kibanaserver` is OpenSearch's own shipped demo-config backend account -- NOT a
+        # secret we invented. Its password is the well-known chart default
+        # ("kibanaserver"), unaffected by OPENSEARCH_INITIAL_ADMIN_PASSWORD (that only
+        # touches the `admin` user). It is never exposed outside the cluster: only this
+        # Dashboards backend process talks to OpenSearch with it. For a real deployment,
+        # give it a custom internal_users.yml entry instead -- see docs/opensearch-design-doc.md.
+        opensearch.username: "kibanaserver"
+        opensearch.password: "kibanaserver"
+        # OpenSearch is using the demo self-signed transport/http certs.
+        opensearch.ssl.verificationMode: none
+        opensearch.requestHeadersAllowlist: ["securitytenant", "Authorization"]
+
+        # ---- authentication -------------------------------------------------
+        opensearch_security.auth.type: "basicauth"
+
+        # ---- cookies / session ---------------------------------------------
+        # Static, >= 32 chars (hard schema minimum -- Dashboards refuses to start below
+        # it). Regenerate for real use with:
+        #   openssl rand -base64 48 | tr -d '\n=+/' | cut -c1-48
+        opensearch_security.cookie.password: "kJ8pN2vR5xT9wQ4mL7hF1sD6gY3cB0eA"
+        # false, not true: Dashboards is served over plain HTTP in stage 1 -- a `Secure`
+        # cookie is silently dropped by every browser over http://, which breaks login
+        # in a way that looks like OpenSearch itself is rejecting the credentials.
+        opensearch_security.cookie.secure: false
+        opensearch_security.cookie.ttl: 3600000
+        opensearch_security.cookie.isSameSite: "Lax"
+        opensearch_security.session.ttl: 3600000
+        opensearch_security.session.keepalive: true
+
+        opensearch_security.ui.basicauth.login.showbrandimage: false
+        opensearch_security.multitenancy.enabled: false
+
+        # ---- observability plugin defaults ---------------------------------
+        home.disableWelcomeScreen: true

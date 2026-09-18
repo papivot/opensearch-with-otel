@@ -1,0 +1,132 @@
+# The OpenTelemetry Demo (chart 0.41.2 / app 3.0.0) as the telemetry source.
+#
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: otel-demo
+  namespace: observability
+spec:
+  interval: 30m
+  timeout: 20m
+  releaseName: otel-demo
+  targetNamespace: otel-demo
+  storageNamespace: otel-demo
+  chart:
+    spec:
+      chart: opentelemetry-demo
+      version: "0.41.2"
+      sourceRef:
+        kind: HelmRepository
+        name: open-telemetry
+      interval: 12h
+  install:
+    remediation:
+      retries: 3
+    timeout: 20m
+  upgrade:
+    cleanupOnFail: true
+    remediation:
+      retries: 3
+      strategy: rollback
+    timeout: 20m
+  driftDetection:
+    mode: enabled
+
+  # Publish the storefront LoadBalancer on port 80, not 8080.
+  #
+  # The chart derives targetPort from service.port, so 80 -> 8080 cannot be expressed
+  # in values alone; patch the rendered Service instead.
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              kind: Service
+              name: frontend-proxy
+            # Two ports, deliberately.
+            #
+            # 80 exists so the LoadBalancer can publish a standard port to users.
+            #
+            # 8080 exists because every in-cluster client assumes it -- the chart wires
+            # K6_TARGET_URL=http://frontend-proxy:8080 and there is no single value to
+            # override it with. Publishing ONLY 80 silently breaks the load generator:
+            # packets to ClusterIP:8080 match no kube-proxy rule and are dropped, so k6
+            # reports `dial: i/o timeout` and the demo generates no traffic at all.
+            patch: |
+              - op: replace
+                path: /spec/ports/0/name
+                value: http
+              - op: replace
+                path: /spec/ports/0/port
+                value: 80
+              - op: replace
+                path: /spec/ports/0/targetPort
+                value: 8080
+              - op: add
+                path: /spec/ports/-
+                value:
+                  name: http-alt
+                  port: 8080
+                  targetPort: 8080
+                  protocol: TCP
+  values:
+    opentelemetry-collector:
+      enabled: false
+    otel-ebpf-profiler:
+      enabled: false
+    jaeger:
+      enabled: false
+    prometheus:
+      enabled: false
+    grafana:
+      enabled: false
+    opensearch:
+      enabled: false
+
+    default:
+      image:
+        repository: ghcr.io/open-telemetry/demo
+        pullPolicy: IfNotPresent
+      replicas: 1
+      envOverrides:
+        - name: OTEL_COLLECTOR_NAME
+          value: "otel-gateway-collector.observability.svc.cluster.local"
+
+    components:
+      chatbot:
+        enabled: false
+      agent:
+        enabled: false
+      mcp:
+        enabled: false
+      telemetry-docs:
+        enabled: false
+      opamp-server:
+        enabled: false
+
+      frontend-proxy:
+        service:
+          type: LoadBalancer
+          port: 8080
+
+      # Browser-side spans are posted by the user's browser, not the pod, so this must
+      # be a URL the browser can reach -- same-origin with however users actually open
+      # the shop, or the POST is cross-origin and the spans are lost.
+      #
+      # THIS VALUE CANNOT BE STATIC UP FRONT: it depends on the frontend-proxy
+      # LoadBalancer's externally-assigned IP, which does not exist before first apply.
+      # Two-step apply required:
+      #   1. kubectl apply -f manifests/   (this placeholder is fine for pass 1)
+      #   2. kubectl -n otel-demo get svc frontend-proxy \
+      #        -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      #      edit the value below to that IP, then:
+      #      kubectl apply -f manifests/11-hr-otel-demo.yaml
+      frontend:
+        envOverrides:
+          - name: PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+            value: "http://10.138.169.19/otlp-http/v1/traces"
+
+      load-generator:
+        enabled: true
+        envOverrides:
+          - name: K6_OTEL_EXPORT_INTERVAL
+            value: "60s"
